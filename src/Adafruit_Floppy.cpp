@@ -139,15 +139,11 @@ void Adafruit_FloppyBase::soft_reset(void) {
   }
 
   select_delay_us = 10;
-  step_delay_us = 12000;
+  step_delay_us = 10000;
   settle_delay_ms = 15;
   motor_delay_ms = 1000;
   watchdog_delay_ms = 1000;
   bus_type = BUSTYPE_IBMPC;
-
-  is_drive_selected = false;
-  is_motor_spinning = false;
-  is_index_seen = false;
 
   if (led_pin >= 0) {
     pinMode(led_pin, OUTPUT);
@@ -172,9 +168,6 @@ void Adafruit_FloppyBase::end(void) {
   if (_indexpin >= 0) {
     pinMode(_indexpin, INPUT);
   }
-  is_drive_selected = false;
-  is_motor_spinning = false;
-  is_index_seen = false;
 }
 
 /**************************************************************************/
@@ -258,7 +251,6 @@ void Adafruit_Floppy::end(void) {
 /**************************************************************************/
 void Adafruit_Floppy::select(bool selected) {
   digitalWrite(_selectpin, !selected); // Selected logic level 0!
-  is_drive_selected = selected;
   // Select drive
   delayMicroseconds(select_delay_us);
 }
@@ -292,18 +284,9 @@ bool Adafruit_Floppy::side(int head) {
 */
 /**************************************************************************/
 bool Adafruit_Floppy::spin_motor(bool motor_on) {
-  if (motor_on != is_motor_spinning) {
-    digitalWrite(_motorpin, !motor_on); // Motor on is logic level 0!
-    is_motor_spinning = motor_on;
-  }
-
-  if (!motor_on) {
-    is_index_seen = false;
+  digitalWrite(_motorpin, !motor_on); // Motor on is logic level 0!
+  if (!motor_on)
     return true; // we're done, easy!
-  }
-
-  if (is_index_seen)
-    return true; // motor on and already have seen index pulses
 
   delay(motor_delay_ms); // Main motor turn on
 
@@ -321,16 +304,14 @@ bool Adafruit_Floppy::spin_motor(bool motor_on) {
     yield();
   }
 
-  is_index_seen = !timedout;
-
-  if (debug_serial) {
-    if (timedout) {
+  if (timedout) {
+    if (debug_serial)
       debug_serial->println("Didn't find an index pulse!");
-    } else {
-      debug_serial->println("Found!");
-    }
+    return false;
   }
-  return is_index_seen;
+  if (debug_serial)
+    debug_serial->println("Found!");
+  return true;
 }
 
 /**************************************************************************/
@@ -350,9 +331,17 @@ bool Adafruit_Floppy::goto_track(int track_num) {
 
     // step back a lil more than expected just in case we really seeked out
     uint8_t max_steps = 100;
+    if (debug_serial) {
+      debug_serial->printf("Track0 pin: %d, initial reading: %d\n", _track0pin, digitalRead(_track0pin));
+    }
     while (max_steps--) {
-      if (!digitalRead(_track0pin)) {
+      int track0_reading = digitalRead(_track0pin);
+      if (debug_serial && max_steps % 10 == 0) {
+        debug_serial->printf("Step %d, track0 reading: %d\n", 100-max_steps, track0_reading);
+      }
+      if (!track0_reading) {
         _track = 0;
+        if (debug_serial) debug_serial->println("Found track 0!");
         break;
       }
       step(STEP_OUT, 1);
@@ -373,7 +362,6 @@ bool Adafruit_Floppy::goto_track(int track_num) {
 
       if (digitalRead(_track0pin)) {
         // STILL not found!
-        _track = -1; // We don't know where we really are
         if (debug_serial)
           debug_serial->println("Could not find track 0");
         return false; // we 'timed' out, were not able to locate track 0
@@ -596,54 +584,94 @@ uint32_t Adafruit_FloppyBase::getSampleFrequency(void) {
 */
 /**************************************************************************/
 size_t Adafruit_FloppyBase::capture_track(
-    volatile uint8_t *pulses, size_t max_pulses, int32_t *falling_index_offset,
-    bool store_greaseweazle, uint32_t capture_ms, uint32_t index_wait_ms) {
-  memset((void *)pulses, 0, max_pulses); // zero zem out
+    volatile uint8_t *pulses,
+    size_t max_pulses,
+    int32_t *falling_index_offset,
+    bool store_greaseweazle,
+    uint32_t capture_ms,
+    uint32_t index_wait_ms)
+{
+  memset((void *)pulses, 0, max_pulses);
 
 #if defined(ARDUINO_ARCH_RP2040)
-  return rp2040_flux_capture(_indexpin, _rddatapin, pulses, pulses + max_pulses,
-                             falling_index_offset, store_greaseweazle,
-                             capture_ms * (getSampleFrequency() / 1000),
-                             index_wait_ms);
-#elif defined(__SAMD51__)
-  noInterrupts();
-  if (index_wait_ms) {
-    wait_for_index_pulse_low();
-  }
+  return rp2040_capture_track(pulses, max_pulses,
+                              falling_index_offset,
+                              store_greaseweazle,
+                              capture_ms,
+                              index_wait_ms);
 
+#elif defined(__SAMD51__)
+  if (index_wait_ms) {
+    uint32_t start = millis();
+    bool last = read_index();
+
+    while ((millis() - start) < index_wait_ms) {
+      bool cur = read_index();
+
+      if (last && !cur) {
+        break; // got falling edge
+      }
+
+      last = cur;
+      yield();
+    }
+  }
+  noInterrupts();
   disable_capture();
-  // in case the timer was reused, we will re-init it each time!
   init_capture();
-  // allow interrupts
-  interrupts();
-  int32_t start_time = millis();
-  // init global interrupt data
+
+  // reset globals BEFORE enabling interrupts
   g_flux_pulses = pulses;
   g_max_pulses = max_pulses;
   g_n_pulses = 0;
   g_store_greaseweazle = store_greaseweazle;
-  // enable capture
+
+  interrupts();
+  delay(5);
   enable_capture();
-  // meanwhile... wait for *second* low pulse
-  if (index_wait_ms) {
-    wait_for_index_pulse_low();
-    // track when it happened for later...
-    *falling_index_offset = g_n_pulses;
+
+  uint32_t start_time = millis();
+  bool last_index = read_index();
+  bool index_seen = false;
+
+  if (falling_index_offset) {
+    *falling_index_offset = -1;
   }
 
-  if (!capture_ms) {
-    // wait another 50ms which is about 1/4 of a track
-    delay(50);
-  } else {
-    int32_t remaining = capture_ms - (millis() - start_time);
-    if (remaining > 0) {
-      debug_serial->printf("Delaying another %d ms post-index\n\r", remaining);
-      delay(remaining);
+  while (true) {
+    if (capture_ms) {
+      if ((millis() - start_time) >= capture_ms) {
+        break;
+      }
+    } else {
+      if ((millis() - start_time) >= 250) {
+        break;
+      }
     }
+
+    bool cur_index = read_index();
+    if (!index_seen && last_index && !cur_index) {
+      index_seen = true;
+      if (falling_index_offset) {
+        *falling_index_offset = g_n_pulses;
+      }
+    }
+    last_index = cur_index;
+
+    // prevent overflow runaway
+    if (g_n_pulses >= (max_pulses - 10)) {
+      if (debug_serial) {
+        debug_serial->println("Capture buffer nearly full");
+      }
+      break;
+    }
+    yield();
   }
-  // ok we're done, clean up!
   disable_capture();
   deinit_capture();
+  if (debug_serial && g_n_pulses == 0) {
+    debug_serial->println("WARNING: No flux captured!");
+  }
   return g_n_pulses;
 
 #else // bitbang it!
@@ -729,6 +757,7 @@ size_t Adafruit_FloppyBase::capture_track(
   return pulses_ptr - pulses;
 #endif
 }
+
 
 /**************************************************************************/
 /*!
@@ -850,7 +879,6 @@ bool Adafruit_FloppyBase::write_track(uint8_t *pulses, size_t n_pulses,
 */
 /**************************************************************************/
 void Adafruit_FloppyBase::wait_for_index_pulse_low(void) {
-  // initial state
   bool index_state = read_index();
   bool last_index_state = index_state;
 
@@ -861,6 +889,7 @@ void Adafruit_FloppyBase::wait_for_index_pulse_low(void) {
       return;
     }
     last_index_state = index_state;
+	//yield();
   }
 }
 
@@ -1036,17 +1065,7 @@ void Adafruit_Apple2Floppy::soft_reset() {
 */
 /**************************************************************************/
 void Adafruit_Apple2Floppy::select(bool selected) {
-  if (selected == is_drive_selected)
-    return; // Already in correct state
-
   digitalWrite(_selectpin, !selected);
-  is_drive_selected = selected;
-  is_motor_spinning = selected;
-
-  // Selecting the drive also turns the motor on, but we need to look
-  // for index pulses, so leave that job to spin_motor.
-  is_index_seen = false;
-
   if (debug_serial)
     debug_serial->printf("set selectpin %d to %d\n", _selectpin, !selected);
 }
@@ -1062,44 +1081,38 @@ void Adafruit_Apple2Floppy::select(bool selected) {
 */
 /**************************************************************************/
 bool Adafruit_Apple2Floppy::spin_motor(bool motor_on) {
-  if (!motor_on)
-    return true; // Nothing to do
+  if (motor_on) {
+    delay(motor_delay_ms); // Main motor turn on
 
-  if (motor_on && is_index_seen)
-    return true; // motor on and already have index pulses
+    uint32_t index_stamp = millis();
+    bool timedout = false;
 
-  delay(motor_delay_ms); // Main motor turn on
+    if (debug_serial)
+      debug_serial->print("Waiting for index pulse...");
 
-  uint32_t index_stamp = millis();
-  bool timedout = false;
-
-  if (debug_serial)
-    debug_serial->print("Waiting for index pulse...");
-
-  while (!read_index()) {
-    if ((millis() - index_stamp) > 10000) {
-      timedout = true; // its been 10 seconds?
-      break;
+    while (!read_index()) {
+      if ((millis() - index_stamp) > 10000) {
+        timedout = true; // its been 10 seconds?
+        break;
+      }
     }
-  }
 
-  while (read_index()) {
-    if ((millis() - index_stamp) > 10000) {
-      timedout = true; // its been 10 seconds?
-      break;
+    while (read_index()) {
+      if ((millis() - index_stamp) > 10000) {
+        timedout = true; // its been 10 seconds?
+        break;
+      }
     }
-  }
 
-  is_index_seen = !timedout;
-
-  if (debug_serial) {
     if (timedout) {
-      debug_serial->println("Didn't find an index pulse!");
-    } else {
-      debug_serial->println("Found!");
+      if (debug_serial)
+        debug_serial->println("Didn't find an index pulse!");
+      return false;
     }
+    if (debug_serial)
+      debug_serial->println("Found!");
   }
-  return is_index_seen;
+  return true;
 }
 
 // stepping FORWARD through phases steps OUT towards SMALLER track numbers
