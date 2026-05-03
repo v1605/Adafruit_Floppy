@@ -118,14 +118,14 @@ int32_t Adafruit_MFM_Floppy::readTrack(int logical_track, bool head) {
 
   uint8_t physical_track = _double_step ? 2 * logical_track : logical_track;
 
-  Serial.printf("\t[readTrack] Seeking track %d [phys=%d] head %d...\r\n",
+  if (_debug_enabled) Serial.printf("\t[readTrack] Seeking track %d [phys=%d] head %d...\r\n",
                 logical_track, physical_track, head);
   if (!_floppy->goto_track(physical_track)) {
-    // Serial.println("failed to seek to track");
+    // if (_debug_enabled) Serial.println("failed to seek to track");
     return -1;
   }
   _floppy->side(head);
-  // Serial.println("done!");
+  // if (_debug_enabled) Serial.println("done!");
   // flux not decoding from a 3.5" floppy? Maybe it's rotating at 360RPM instead
   // of 300RPM see e.g.,
   // https://www.retrotechnology.com/herbs_stuff/drive.html#rotate2
@@ -143,7 +143,7 @@ int32_t Adafruit_MFM_Floppy::readTrack(int logical_track, bool head) {
 
   _track_has_errors = (captured_sectors != _sectors_per_track);
   if (_track_has_errors) {
-    Serial.printf("Track %d/%d has errors (%d != %d)\n", logical_track, head,
+    if (_debug_enabled) Serial.printf("Track %d/%d has errors (%d != %d)\n", logical_track, head,
                   captured_sectors, _sectors_per_track);
   }
   _last_track_read = logical_track * FLOPPY_HEADS + head;
@@ -267,7 +267,7 @@ bool Adafruit_MFM_Floppy::writeSector(uint32_t block, const uint8_t *src) {
 
     _last_track_read = track * FLOPPY_HEADS + head;
   }
-  Serial.printf("Writing block %d\r\n", block);
+  if (_debug_enabled) Serial.printf("Writing block %d\r\n", block);
   track_validity[subsector] = 1;
   memcpy(track_data + (subsector * MFM_BYTES_PER_SECTOR), src,
          MFM_BYTES_PER_SECTOR);
@@ -311,16 +311,16 @@ bool Adafruit_MFM_Floppy::syncDevice() {
   int head = _last_track_read % FLOPPY_HEADS;
 
   uint8_t physical_track = _double_step ? 2 * logical_track : logical_track;
-  Serial.printf("Flushing track %d [phys %d] side %d\r\n", logical_track,
+  if (_debug_enabled) Serial.printf("Flushing track %d [phys %d] side %d\r\n", logical_track,
                 physical_track, head);
   // should be a no-op
   if (!_floppy->goto_track(physical_track)) {
-    Serial.println("failed to seek to track");
+    if (_debug_enabled) Serial.println("failed to seek to track");
     return false;
   }
 
   if (!_floppy->side(head)) {
-    Serial.println("failed to select head");
+    if (_debug_enabled) Serial.println("failed to select head");
     return false;
   }
 
@@ -330,7 +330,7 @@ bool Adafruit_MFM_Floppy::syncDevice() {
   }
 
   if (has_errors) {
-    Serial.printf(
+    if (_debug_enabled) Serial.printf(
         "Can't do a non-full track write to track with read errors\n");
     return false;
   }
@@ -339,7 +339,7 @@ bool Adafruit_MFM_Floppy::syncDevice() {
                                       logical_track);
 
   if (!_floppy->write_track(_flux, _n_flux, false)) {
-    Serial.println("failed to write track");
+    if (_debug_enabled) Serial.println("failed to write track");
     return false;
   }
 
@@ -357,60 +357,88 @@ void Adafruit_MFM_Floppy::removed() {
 static uint16_t le16_at(uint8_t *ptr) { return ptr[0] | (ptr[1] << 8); }
 
 bool Adafruit_MFM_Floppy::autodetect() {
-  Serial.printf("autodetecting\r\n");
+  if (_debug_enabled) Serial.println("autodetect");
+
   int32_t index_offset;
-  _n_flux = _floppy->capture_track(_flux, sizeof(_flux) / 16, &index_offset,
-                                   false, 220);
-  for (auto flux_rate_ns : flux_rates) {
-    Serial.printf("flux rate %d\r\n", flux_rate_ns);
-    auto captured_sectors =
-        _floppy->decode_track_mfm(track_data, 1, track_validity, _flux, _n_flux,
-                                  flux_rate_ns / 1000.f, true);
-    if (captured_sectors) {
-      auto valid_signature =
-          track_data[0] == 0xeb && // short jump
-          track_data[1] >= 0x1e && // minimum BPB size (DOS 3.0 BPB)
-          track_data[2] == 0x90;   // NOP
-      if (!valid_signature) {
-        Serial.printf("Invalid signature %02x %02x %02x\r\n", track_data[0],
-                      track_data[1], track_data[2]);
-        continue;
-      }
-      auto heads = le16_at(track_data + 0x1A);
-      auto total_logical_sectors = le16_at(track_data + 0x13);
+  _n_flux = _floppy->capture_track(_flux, sizeof(_flux), &index_offset, false, 300);
 
-      _bit_time_ns = flux_rate_ns;
-      _sectors_per_track = le16_at(track_data + 0x18);
-      _tracks_per_side = total_logical_sectors / heads / _sectors_per_track;
-      _last_track_read = NO_TRACK;
-      _dirty = false;
+  if (_debug_enabled) {
+    Serial.print("Pulses captured: ");
+    Serial.println(_n_flux);
+  }
 
-      if (_tracks_per_side <= 40) {
-        _floppy->goto_track(2);
-        _n_flux = _floppy->capture_track(_flux, sizeof(_flux) / 16,
-                                         &index_offset, false, 220);
-        uint8_t track_number;
-        auto captured_sectors = _floppy->decode_track_mfm(
-            track_data, 1, track_validity, _flux, _n_flux,
-            flux_rate_ns / 1000.f, true, &track_number);
-        if (!captured_sectors) {
-          Serial.printf("failed to read on physical track 2\r\n");
-        }
-        _double_step = (track_number == 1);
-        Serial.printf(
-            "on physical track 2, track_number=%d. _double_step <- %d\r\n",
-            track_number, _double_step);
-      } else {
-        _double_step = false;
-      }
-      Serial.printf("Detected flux rate %dns/bit\r\n%d/%d/%d C/H/S\r\n",
-                    flux_rate_ns, _tracks_per_side, heads, _sectors_per_track);
-      return true;
+  int bestScore = -1;
+  int bestIndex = -1;
+
+  // Iterate through the existing format table
+  for (int i = 0; i < AUTODETECT; i++) {
+    const auto &info = _format_info[i];
+    if (_debug_enabled) Serial.printf("Trying format index %d (%dns bit time)\n", i, info.bit_time_ns);
+
+    // Attempt to decode using the global definition's sectors and bit time
+    int captured = _floppy->decode_track_mfm(
+        track_data,
+        info.sectors,
+        track_validity,
+        _flux,
+        _n_flux,
+        info.bit_time_ns / 1000.0f,
+        true);
+
+    if (_debug_enabled) Serial.printf(" -> sectors found: %d\n", captured);
+
+    // Keep track of which format yielded the most valid sectors[cite: 1]
+    if (captured > bestScore) {
+      bestScore = captured;
+      bestIndex = i;
     }
   }
-  Serial.printf("failed autodetect\r\n");
-  _sectors_per_track = 0;
-  return false;
+
+  if (bestScore <= 0) {
+    if (_debug_enabled) Serial.println("Autodetect failed: no sectors decoded");
+    return false;
+  }
+
+  // Apply the parameters from the winning format index
+  const auto &best = _format_info[bestIndex];
+  _format = (adafruit_floppy_disk_t)bestIndex;
+  _bit_time_ns = best.bit_time_ns;
+  _sectors_per_track = best.sectors;
+  _tracks_per_side = best.cylinders;
+
+  // Determine High Density based on sector count or format type[cite: 1]
+  _high_density = (best.sectors >= 15); 
+
+  if (_debug_enabled) {
+    const char *format_name;
+    switch (bestIndex) {
+      case IBMPC360K: format_name = "360KB (DD)"; break;
+      case IBMPC1200K: format_name = "1.2MB (HD)"; break;
+      case IBMPC720K: format_name = "720KB (DD)"; break;
+      case IBMPC720K_360RPM: format_name = "720KB (DD, 360RPM)"; break;
+      case IBMPC1440K: format_name = "1.44MB (HD)"; break;
+      case IBMPC1440K_360RPM: format_name = "1.44MB (HD, 360RPM)"; break;
+      default: format_name = "Unknown"; break;
+    }
+    
+    Serial.printf("AUTO-SELECTED FORMAT: %s\n", format_name);
+    Serial.printf("  - Format index: %d\n", bestIndex);
+    Serial.printf("  - Bit time: %dns\n", _bit_time_ns);
+    Serial.printf("  - Sectors per track: %d\n", _sectors_per_track);
+    Serial.printf("  - Tracks per side: %d\n", _tracks_per_side);
+    Serial.printf("  - Density: %s\n", _high_density ? "High" : "Double");
+    Serial.printf("  - Detection score: %d\n", bestScore);
+  }
+
+  _last_track_read = NO_TRACK;
+  _dirty = false;
+
+  return true;
+}
+
+
+void Adafruit_MFM_Floppy::setDebug(bool enabled) {
+  _debug_enabled = enabled;
 }
 
 bool Adafruit_MFM_Floppy::inserted(adafruit_floppy_disk_t floppy_type) {
