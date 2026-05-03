@@ -18,8 +18,6 @@
 #include "Arduino.h"
 #include <Adafruit_SPIDevice.h>
 // to implement SdFat Block Driver
-//
-#define DISABLE_FS_H_WARNING
 #include "SdFat.h"
 #include "SdFatConfig.h"
 
@@ -77,14 +75,6 @@ public:
   virtual void select(bool selected) = 0;
   /**************************************************************************/
   /*!
-      @brief  Is the drive selected based on interal caching
-      @returns True if the drive is selected, false otherwise
-  */
-  /**************************************************************************/
-  bool drive_is_selected(void) { return is_drive_selected; }
-
-  /**************************************************************************/
-  /*!
       @brief  Turn on or off the floppy motor, if on we wait till we get an
      index pulse!
       @param motor_on True to turn on motor, False to turn it off
@@ -93,20 +83,6 @@ public:
   */
   /**************************************************************************/
   virtual bool spin_motor(bool motor_on) = 0;
-  /**************************************************************************/
-  /*!
-      @brief  Is the drive motor spinning based on interal caching
-      @returns True if the motor is spinning, false otherwise
-  */
-  /**************************************************************************/
-  bool motor_is_spinning(void) { return is_motor_spinning; }
-  /**************************************************************************/
-  /*!
-      @brief  Are index pulses being seen?
-      @returns True if we're seeing index pulses, false otherwise
-  */
-  /**************************************************************************/
-  bool index_pulses_seen(void) { return is_index_seen; }
   /**************************************************************************/
   /*!
       @brief  Seek to the desired track, requires the motor to be spun up!
@@ -217,9 +193,6 @@ public:
 
 protected:
   bool read_index();
-  bool is_drive_selected; ///< cached drive select state
-  bool is_motor_spinning; ///< cached motor spinning state
-  bool is_index_seen;     ///< cached index pulses seen state
 
 private:
 #if defined(__SAMD51__)
@@ -372,6 +345,9 @@ public:
        @returns True if media is hard coded or if the media was detected by
      autodetect */
   bool inserted(adafruit_floppy_disk_t format);
+  /**! @brief Enable or disable debug output via Serial
+       @param enabled True to enable debug output, false to disable */
+  void setDebug(bool enabled);
 
   //------------- SdFat v2 FsBlockDeviceInterface API -------------//
   virtual bool isBusy();
@@ -404,6 +380,7 @@ private:
   bool _double_step = false;
   Adafruit_Floppy *_floppy = nullptr;
   adafruit_floppy_disk_t _format = AUTODETECT;
+  bool _debug_enabled = false;
 
   /**! The raw flux data from the last track read */
   uint8_t _flux[125000];
